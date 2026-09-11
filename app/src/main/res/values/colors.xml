@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="nextgoal_black">#050609</color>
+    <color name="nextgoal_surface">#11141C</color>
+    <color name="nextgoal_cyan">#08D7FF</color>
+    <color name="nextgoal_blue">#0B75FF</color>
+    <color name="nextgoal_muted">#8993A6</color>
+</resources>
