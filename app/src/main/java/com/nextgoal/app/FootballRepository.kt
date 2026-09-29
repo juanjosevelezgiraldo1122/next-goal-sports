@@ -11,6 +11,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.text.Normalizer
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.LocalDate
@@ -410,8 +411,7 @@ class FootballRepository(private val token: String) {
                 add(
                     Match(
                         id = raw.optInt("id", 0),
-                        competition = competitionJson?.optString("name")
-                            .orEmpty().ifBlank { "Competición" },
+                        competition = spanishCompetitionName(competitionJson?.optString("name").orEmpty()),
                         competitionShort = competitionJson?.optString("code")
                             .orEmpty().ifBlank { "FÚTBOL" },
                         competitionCode = competitionJson?.optString("code")
@@ -500,7 +500,7 @@ class FootballRepository(private val token: String) {
             val status = event.optString("strStatus").lowercase(NEXT_GOAL_LOCALE)
                 val progress = event.optString("strProgress")
                 val phase = when {
-                    status.contains("finished") || status.contains("final") -> MatchPhase.FINISHED
+                    status.contains("finished") || status.contains("final") || status == "ft" || status == "aet" -> MatchPhase.FINISHED
                     status.contains("live") || progress.contains("'") -> MatchPhase.LIVE
                     else -> MatchPhase.UPCOMING
                 }
@@ -530,7 +530,8 @@ class FootballRepository(private val token: String) {
                         kickoffLabel = if (phase == MatchPhase.FINISHED) "FINALIZADO" else if (phase == MatchPhase.LIVE) "EN VIVO" else event.optString("strTimeLocal").take(5).ifBlank { event.optString("strTime").take(5).ifBlank { "20:00" } },
                         phase = phase,
                         venue = event.optString("strVenue").ifBlank { "Estadio por confirmar" },
-                        kickoffMillis = parseTimestamp(event.optString("strTimestamp"))
+                        kickoffMillis = parseTimestamp(event.optString("strTimestamp")),
+                        externalEventId = event.optString("idEvent").ifBlank { null }
                     )
                 )
             }
@@ -549,6 +550,312 @@ class FootballRepository(private val token: String) {
         }.getOrDefault(emptyList())
     }
 
+    suspend fun loadMatchDetails(match: Match): Match? = withContext(Dispatchers.IO) {
+        runCatching {
+            val footballDataMatch = if (token.isNotBlank()) {
+                loadFootballDataMatchDetails(match)
+            } else null
+            if (footballDataMatch?.stats != null) return@runCatching footballDataMatch
+
+            val sourceMatch = footballDataMatch ?: match
+            val event = resolveSportsDbEvent(sourceMatch) ?: return@runCatching footballDataMatch
+            val eventId = event.optString("idEvent").ifBlank { return@runCatching null }
+            val statsPayload = runCatching {
+                request("https://www.thesportsdb.com/api/v1/json/3/lookupeventstats.php?id=$eventId", includeToken = false)
+            }.getOrDefault(JSONObject())
+            val timelinePayload = runCatching {
+                request("https://www.thesportsdb.com/api/v1/json/3/lookuptimeline.php?id=$eventId", includeToken = false)
+            }.getOrDefault(JSONObject())
+            val updated = mergeSportsDbEvent(sourceMatch, event)
+            updated.copy(
+                stats = parseSportsDbStats(statsPayload) ?: sourceMatch.stats,
+                events = parseSportsDbTimeline(timelinePayload).ifEmpty { sourceMatch.events },
+                externalEventId = eventId
+            )
+        }.getOrNull()
+    }
+
+    private fun loadFootballDataMatchDetails(match: Match): Match? {
+        return runCatching {
+            val raw = request("https://api.football-data.org/v4/matches/${match.id}")
+            val homeJson = raw.optJSONObject("homeTeam") ?: return@runCatching null
+            val awayJson = raw.optJSONObject("awayTeam") ?: return@runCatching null
+            val status = raw.optString("status", "SCHEDULED")
+            val score = raw.optJSONObject("score")
+            val fullTime = score?.optJSONObject("fullTime")
+            val current = score?.optJSONObject("current")
+            val phase = when (status) {
+                "IN_PLAY", "PAUSED", "LIVE" -> MatchPhase.LIVE
+                "FINISHED", "AWARDED" -> MatchPhase.FINISHED
+                else -> MatchPhase.UPCOMING
+            }
+            val utcDate = raw.optString("utcDate")
+            val competition = raw.optJSONObject("competition")
+            match.copy(
+                competition = spanishCompetitionName(competition?.optString("name").orEmpty()),
+                competitionShort = competition?.optString("code").orEmpty().ifBlank { match.competitionShort },
+                competitionCode = competition?.optString("code").orEmpty().ifBlank { match.competitionCode },
+                home = parseTeam(homeJson),
+                away = parseTeam(awayJson),
+                homeScore = fullTime?.nullableInt("home") ?: current?.nullableInt("home") ?: match.homeScore,
+                awayScore = fullTime?.nullableInt("away") ?: current?.nullableInt("away") ?: match.awayScore,
+                minute = raw.nullableInt("minute") ?: score?.nullableInt("minute") ?: match.minute,
+                kickoffLabel = formatKickoff(utcDate, phase),
+                phase = phase,
+                venue = raw.optString("venue").ifBlank { match.venue },
+                kickoffMillis = parseTimestamp(utcDate).takeIf { it > 0L } ?: match.kickoffMillis,
+                stats = parseMatchStats(homeJson, awayJson) ?: match.stats,
+                events = parseMatchEvents(raw).ifEmpty { match.events },
+                externalEventId = match.externalEventId
+            )
+        }.getOrNull()
+    }
+
+    private fun resolveSportsDbEvent(match: Match): JSONObject? {
+        match.externalEventId?.takeIf { it.isNotBlank() }?.let { eventId ->
+            runCatching {
+                request("https://www.thesportsdb.com/api/v1/json/3/lookupevent.php?id=$eventId", includeToken = false)
+                    .optJSONArray("events")
+                    ?.optJSONObject(0)
+            }.getOrNull()?.let { return it }
+        }
+
+        val date = if (match.kickoffMillis > 0L) {
+            Instant.ofEpochMilli(match.kickoffMillis).atZone(NEXT_GOAL_TIME_ZONE).toLocalDate()
+        } else {
+            LocalDate.now(NEXT_GOAL_TIME_ZONE)
+        }
+        val dayEvents = runCatching {
+            request(
+                "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=$date&s=Soccer",
+                includeToken = false
+            ).optJSONArray("events")
+        }.getOrNull()
+        selectSportsDbEvent(dayEvents, match)?.let { return it }
+
+        val query = URLEncoder.encode("${match.home.name}_vs_${match.away.name}", "UTF-8")
+            .replace("+", "_")
+        val searchEvents = runCatching {
+            val payload = request(
+                "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$query&d=$date&s=Soccer",
+                includeToken = false
+            )
+            payload.optJSONArray("event") ?: payload.optJSONArray("events")
+        }.getOrNull()
+        return selectSportsDbEvent(searchEvents, match)
+    }
+
+    private fun selectSportsDbEvent(events: JSONArray?, match: Match): JSONObject? {
+        if (events == null || events.length() == 0) return null
+        val expectedDate = if (match.kickoffMillis > 0L) {
+            Instant.ofEpochMilli(match.kickoffMillis).atZone(NEXT_GOAL_TIME_ZONE).toLocalDate()
+        } else null
+        val expectedTimestamp = match.kickoffMillis
+        val candidates = buildList {
+            for (index in 0 until events.length()) {
+                val event = events.optJSONObject(index) ?: continue
+                val teamScore = teamSimilarity(match.home.name, event.optString("strHomeTeam")) +
+                    teamSimilarity(match.away.name, event.optString("strAwayTeam"))
+                if (teamScore < 9) continue
+                val eventTimestamp = parseTimestamp(event.optString("strTimestamp"))
+                val sameDate = expectedDate != null && eventTimestamp > 0L &&
+                    Instant.ofEpochMilli(eventTimestamp).atZone(NEXT_GOAL_TIME_ZONE).toLocalDate() == expectedDate
+                val timeScore = when {
+                    sameDate && expectedTimestamp > 0L && eventTimestamp > 0L &&
+                        kotlin.math.abs(eventTimestamp - expectedTimestamp) <= 18 * 60 * 60 * 1000L -> 4
+                    sameDate -> 2
+                    else -> 0
+                }
+                add((teamScore * 10 + timeScore) to event)
+            }
+        }
+        return candidates.maxByOrNull { it.first }?.second
+    }
+
+    private fun teamSimilarity(expected: String, actual: String): Int {
+        val left = normalizeTeamName(expected)
+        val right = normalizeTeamName(actual)
+        if (left.isBlank() || right.isBlank()) return 0
+        if (left == right) return 6
+        if (left.contains(right) || right.contains(left)) return 5
+        val leftTokens = left.split(" ").filter { it.length > 2 }.toSet()
+        val rightTokens = right.split(" ").filter { it.length > 2 }.toSet()
+        return (leftTokens intersect rightTokens).size * 3
+    }
+
+    private fun normalizeTeamName(value: String): String {
+        return Normalizer.normalize(value.lowercase(Locale.ROOT), Normalizer.Form.NFD)
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+            .replace(Regex("\\b(fc|cf|afc|ac|club|football|futbol|cd|ca|sc|rc)\\b"), " ")
+            .replace(Regex("[^a-z0-9 ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun mergeSportsDbEvent(match: Match, event: JSONObject): Match {
+        val status = event.optString("strStatus").lowercase(NEXT_GOAL_LOCALE)
+        val progress = event.optString("strProgress").lowercase(NEXT_GOAL_LOCALE)
+        val phase = when {
+            status.contains("finished") || status.contains("final") || status == "ft" || status == "aet" -> MatchPhase.FINISHED
+            status.contains("live") || status.contains("half") || progress.contains("'") || progress.matches(Regex(".*\\d+.*")) -> MatchPhase.LIVE
+            else -> match.phase
+        }
+        val timestamp = parseTimestamp(event.optString("strTimestamp"))
+        return match.copy(
+            homeScore = event.nullableInt("intHomeScore") ?: match.homeScore,
+            awayScore = event.nullableInt("intAwayScore") ?: match.awayScore,
+            minute = parseSportsDbMinute(event) ?: match.minute,
+            phase = phase,
+            kickoffLabel = formatKickoff(
+                event.optString("strTimestamp").ifBlank { formatTimestamp(timestamp) },
+                phase
+            ),
+            venue = event.optString("strVenue").ifBlank { match.venue },
+            kickoffMillis = timestamp.takeIf { it > 0L } ?: match.kickoffMillis,
+            competition = spanishCompetitionName(event.optString("strLeague").ifBlank { match.competition })
+        )
+    }
+
+    private fun formatTimestamp(timestamp: Long): String {
+        if (timestamp <= 0L) return ""
+        return Instant.ofEpochMilli(timestamp).toString()
+    }
+
+    private fun parseSportsDbMinute(event: JSONObject): Int? {
+        return Regex("\\d+").find(event.optString("strProgress"))?.value?.toIntOrNull()
+    }
+
+    private fun parseSportsDbStats(payload: JSONObject): MatchStats? {
+        val rows = payload.optJSONArray("eventstats") ?: return null
+        var possession: Pair<Int?, Int?>? = null
+        var shotsOnTarget: Pair<Int?, Int?>? = null
+        var shotsOffTarget: Pair<Int?, Int?>? = null
+        var shots: Pair<Int?, Int?>? = null
+        var blockedShots: Pair<Int?, Int?>? = null
+        var corners: Pair<Int?, Int?>? = null
+        var fouls: Pair<Int?, Int?>? = null
+        var offsides: Pair<Int?, Int?>? = null
+        var freeKicks: Pair<Int?, Int?>? = null
+        var goalKicks: Pair<Int?, Int?>? = null
+        var saves: Pair<Int?, Int?>? = null
+        var throwIns: Pair<Int?, Int?>? = null
+        var yellowCards: Pair<Int?, Int?>? = null
+        var redCards: Pair<Int?, Int?>? = null
+        for (index in 0 until rows.length()) {
+            val row = rows.optJSONObject(index) ?: continue
+            val label = row.optString("strStat").lowercase(NEXT_GOAL_LOCALE)
+            val values = row.statPair()
+            when {
+                label.contains("possession") -> possession = values
+                label.contains("shots on goal") || label.contains("shots on target") -> shotsOnTarget = values
+                label.contains("shots off goal") || label.contains("shots off target") -> shotsOffTarget = values
+                label == "total shots" || label.contains("total shots") -> shots = values
+                label.contains("blocked shots") -> blockedShots = values
+                label.contains("corner") -> corners = values
+                label == "fouls" || label.contains("fouls") -> fouls = values
+                label.contains("offside") -> offsides = values
+                label.contains("free kick") -> freeKicks = values
+                label.contains("goal kick") -> goalKicks = values
+                label.contains("save") -> saves = values
+                label.contains("throw") -> throwIns = values
+                label.contains("yellow card") -> yellowCards = values
+                label.contains("red card") -> redCards = values
+            }
+        }
+        val stats = MatchStats(
+            homePossession = possession?.first,
+            awayPossession = possession?.second,
+            homeShotsOnTarget = shotsOnTarget?.first,
+            awayShotsOnTarget = shotsOnTarget?.second,
+            homeShotsOffTarget = shotsOffTarget?.first,
+            awayShotsOffTarget = shotsOffTarget?.second,
+            homeShots = shots?.first,
+            awayShots = shots?.second,
+            homeBlockedShots = blockedShots?.first,
+            awayBlockedShots = blockedShots?.second,
+            homeCorners = corners?.first,
+            awayCorners = corners?.second,
+            homeFouls = fouls?.first,
+            awayFouls = fouls?.second,
+            homeOffsides = offsides?.first,
+            awayOffsides = offsides?.second,
+            homeFreeKicks = freeKicks?.first,
+            awayFreeKicks = freeKicks?.second,
+            homeGoalKicks = goalKicks?.first,
+            awayGoalKicks = goalKicks?.second,
+            homeSaves = saves?.first,
+            awaySaves = saves?.second,
+            homeThrowIns = throwIns?.first,
+            awayThrowIns = throwIns?.second,
+            homeYellowCards = yellowCards?.first,
+            awayYellowCards = yellowCards?.second,
+            homeRedCards = redCards?.first,
+            awayRedCards = redCards?.second
+        )
+        return stats.takeIf { it.hasAnyPublishedValue() }
+    }
+
+    private fun JSONObject.statPair(): Pair<Int?, Int?> {
+        fun parse(key: String): Int? = optString(key).replace("%", "").trim().toDoubleOrNull()?.toInt()
+        return parse("intHome") to parse("intAway")
+    }
+
+    private fun MatchStats.hasAnyPublishedValue(): Boolean {
+        return listOf(
+            homePossession, awayPossession, homeShotsOnTarget, awayShotsOnTarget,
+            homeShotsOffTarget, awayShotsOffTarget, homeShots, awayShots,
+            homeBlockedShots, awayBlockedShots, homeCorners, awayCorners,
+            homeFouls, awayFouls, homeOffsides, awayOffsides, homeFreeKicks,
+            awayFreeKicks, homeGoalKicks, awayGoalKicks, homeSaves, awaySaves,
+            homeThrowIns, awayThrowIns, homeYellowCards, awayYellowCards,
+            homeRedCards, awayRedCards
+        ).any { it != null }
+    }
+
+    private fun parseSportsDbTimeline(payload: JSONObject): List<MatchEvent> {
+        val timeline = payload.optJSONArray("timeline") ?: return emptyList()
+        return buildList {
+            for (index in 0 until timeline.length()) {
+                val item = timeline.optJSONObject(index) ?: continue
+                val rawType = item.optString("strTimeline").lowercase(NEXT_GOAL_LOCALE)
+                val detail = item.optString("strTimelineDetail").lowercase(NEXT_GOAL_LOCALE)
+                val team = item.optString("strTeam").ifBlank { "Equipo" }
+                val player = item.optString("strPlayer").ifBlank { "Jugador" }
+                val assist = item.optString("strAssist").ifBlank { "" }
+                val minute = item.optString("intTime").filter { it.isDigit() }.toIntOrNull()
+                when {
+                    rawType.contains("goal") -> add(
+                        MatchEvent(
+                            minute = minute,
+                            kind = "GOAL",
+                            title = if (detail.contains("penalty")) "Gol de penalti · $player" else "Gol · $player",
+                            subtitle = if (assist.isBlank()) team else "$team · Asistencia de $assist",
+                            teamName = team
+                        )
+                    )
+                    rawType.contains("card") -> add(
+                        MatchEvent(
+                            minute = minute,
+                            kind = if (detail.contains("red")) "RED_CARD" else "CARD",
+                            title = if (detail.contains("red")) "Tarjeta roja" else "Tarjeta amarilla",
+                            subtitle = "$player · $team",
+                            teamName = team
+                        )
+                    )
+                    rawType.contains("subst") -> add(
+                        MatchEvent(
+                            minute = minute,
+                            kind = "SUBSTITUTION",
+                            title = "Cambio",
+                            subtitle = if (assist.isBlank()) "$team · $player" else "$team · Entra $assist, sale $player",
+                            teamName = team
+                        )
+                    )
+                }
+            }
+        }.sortedBy { it.minute ?: Int.MAX_VALUE }
+    }
+
     private fun parseMatchStats(home: JSONObject, away: JSONObject): MatchStats? {
         val homeStats = home.optJSONObject("statistics")
         val awayStats = away.optJSONObject("statistics")
@@ -557,27 +864,32 @@ class FootballRepository(private val token: String) {
             awayPossession = awayStats?.nullableStatInt("ball_possession"),
             homeShotsOnTarget = homeStats?.nullableStatInt("shots_on_goal"),
             awayShotsOnTarget = awayStats?.nullableStatInt("shots_on_goal"),
+            homeShotsOffTarget = homeStats?.nullableStatInt("shots_off_goal"),
+            awayShotsOffTarget = awayStats?.nullableStatInt("shots_off_goal"),
             homeShots = homeStats?.nullableStatInt("shots"),
             awayShots = awayStats?.nullableStatInt("shots"),
+            homeBlockedShots = homeStats?.nullableStatInt("blocked_shots"),
+            awayBlockedShots = awayStats?.nullableStatInt("blocked_shots"),
             homeCorners = homeStats?.nullableStatInt("corner_kicks"),
             awayCorners = awayStats?.nullableStatInt("corner_kicks"),
             homeFouls = homeStats?.nullableStatInt("fouls"),
-            awayFouls = awayStats?.nullableStatInt("fouls")
+            awayFouls = awayStats?.nullableStatInt("fouls"),
+            homeOffsides = homeStats?.nullableStatInt("offsides"),
+            awayOffsides = awayStats?.nullableStatInt("offsides"),
+            homeFreeKicks = homeStats?.nullableStatInt("free_kicks"),
+            awayFreeKicks = awayStats?.nullableStatInt("free_kicks"),
+            homeGoalKicks = homeStats?.nullableStatInt("goal_kicks"),
+            awayGoalKicks = awayStats?.nullableStatInt("goal_kicks"),
+            homeSaves = homeStats?.nullableStatInt("saves"),
+            awaySaves = awayStats?.nullableStatInt("saves"),
+            homeThrowIns = homeStats?.nullableStatInt("throw_ins"),
+            awayThrowIns = awayStats?.nullableStatInt("throw_ins"),
+            homeYellowCards = homeStats?.nullableStatInt("yellow_cards"),
+            awayYellowCards = awayStats?.nullableStatInt("yellow_cards"),
+            homeRedCards = homeStats?.nullableStatInt("red_cards"),
+            awayRedCards = awayStats?.nullableStatInt("red_cards")
         )
-        return stats.takeIf {
-            listOf(
-                it.homePossession,
-                it.awayPossession,
-                it.homeShotsOnTarget,
-                it.awayShotsOnTarget,
-                it.homeShots,
-                it.awayShots,
-                it.homeCorners,
-                it.awayCorners,
-                it.homeFouls,
-                it.awayFouls
-            ).any { value -> value != null }
-        }
+        return stats.takeIf { it.hasAnyPublishedValue() }
     }
 
     private fun parseMatchEvents(raw: JSONObject): List<MatchEvent> {

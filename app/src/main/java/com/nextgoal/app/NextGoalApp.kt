@@ -97,6 +97,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import java.time.Instant
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
@@ -263,6 +264,7 @@ fun NextGoalApp(viewModel: NextGoalViewModel = viewModel()) {
             directoryState = directory,
             profile = profile,
             onRefresh = viewModel::refresh,
+            onRefreshMatchDetails = viewModel::refreshMatchDetails,
             onUpdateName = viewModel::updateProfileName,
             onUpdatePhoto = viewModel::updateProfilePhoto,
             onUpdateFavoriteTeam = viewModel::updateFavoriteTeam,
@@ -467,6 +469,7 @@ private fun MainShell(
     directoryState: DirectoryState,
     profile: UserProfile,
     onRefresh: () -> Unit,
+    onRefreshMatchDetails: (Int) -> Unit,
     onUpdateName: (String) -> Unit,
     onUpdatePhoto: (String?) -> Unit,
     onUpdateFavoriteTeam: (String) -> Unit,
@@ -521,9 +524,18 @@ private fun MainShell(
         return
     }
     if (selectedMatch != null) {
+        LaunchedEffect(selectedMatch.id) {
+            onRefreshMatchDetails(selectedMatch.id)
+            while (isActive) {
+                delay(30_000)
+                onRefreshMatchDetails(selectedMatch.id)
+            }
+        }
         MatchDetailScreen(
             match = selectedMatch,
-            onBack = { selectedMatchId = null }
+            onBack = { selectedMatchId = null },
+            isRefreshing = dashboardState.refreshingMatchId == selectedMatch.id,
+            onRefresh = { onRefreshMatchDetails(selectedMatch.id) }
         )
         return
     }
@@ -2225,7 +2237,12 @@ private fun maskDestination(destination: String): String {
 }
 
 @Composable
-private fun MatchDetailScreen(match: Match, onBack: () -> Unit) {
+private fun MatchDetailScreen(
+    match: Match,
+    onBack: () -> Unit,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit
+) {
     var selectedTab by rememberSaveable(match.id) { mutableStateOf("ESTADÍSTICAS") }
     val detailTabs = listOf("ESTADÍSTICAS", "ALINEACIONES", "CRONOLOGÍA")
     val context = LocalContext.current
@@ -2238,8 +2255,21 @@ private fun MatchDetailScreen(match: Match, onBack: () -> Unit) {
         ) {
             IconButton(onClick = onBack) { Icon(Icons.Outlined.ArrowBack, contentDescription = "Volver", tint = NextGoalText) }
             Text("DETALLE DEL PARTIDO", style = MaterialTheme.typography.titleMedium)
-            IconButton(onClick = { Toast.makeText(context, "Partido preparado para compartir", Toast.LENGTH_SHORT).show() }) {
-                Icon(Icons.Outlined.Share, contentDescription = "Compartir", tint = NextGoalText)
+            Row {
+                IconButton(onClick = onRefresh) {
+                    if (isRefreshing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(19.dp),
+                            color = NextGoalCyan,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(Icons.Outlined.Refresh, contentDescription = "Actualizar estadísticas", tint = NextGoalText)
+                    }
+                }
+                IconButton(onClick = { Toast.makeText(context, "Partido preparado para compartir", Toast.LENGTH_SHORT).show() }) {
+                    Icon(Icons.Outlined.Share, contentDescription = "Compartir", tint = NextGoalText)
+                }
             }
         }
         LazyColumn(
@@ -2249,7 +2279,13 @@ private fun MatchDetailScreen(match: Match, onBack: () -> Unit) {
         ) {
             item {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(competitionLabel(match), color = NextGoalCyan, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(competitionLabel(match), color = NextGoalCyan, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        if (match.phase == MatchPhase.LIVE) "Estadísticas en vivo · actualización automática"
+                        else "Estadísticas publicadas del partido",
+                        color = NextGoalMuted,
+                        fontSize = 10.sp
+                    )
                     Spacer(Modifier.height(16.dp))
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceEvenly) {
                         TeamColumn(match.home, Modifier.weight(1f))
@@ -2421,18 +2457,36 @@ private fun MatchStats(match: Match) {
             val available = listOf(
                 stats.homePossession to stats.awayPossession,
                 stats.homeShotsOnTarget to stats.awayShotsOnTarget,
+                stats.homeShotsOffTarget to stats.awayShotsOffTarget,
                 stats.homeShots to stats.awayShots,
+                stats.homeBlockedShots to stats.awayBlockedShots,
                 stats.homeCorners to stats.awayCorners,
-                stats.homeFouls to stats.awayFouls
+                stats.homeFouls to stats.awayFouls,
+                stats.homeOffsides to stats.awayOffsides,
+                stats.homeFreeKicks to stats.awayFreeKicks,
+                stats.homeGoalKicks to stats.awayGoalKicks,
+                stats.homeSaves to stats.awaySaves,
+                stats.homeThrowIns to stats.awayThrowIns,
+                stats.homeYellowCards to stats.awayYellowCards,
+                stats.homeRedCards to stats.awayRedCards
             ).count { (home, away) -> home != null && away != null }
             if (available == 0) {
                 EmptyResults("Esta fuente no ha publicado estadísticas avanzadas para este partido.")
             } else {
                 MatchStatRow("POSESIÓN", stats.homePossession, stats.awayPossession, "%")
                 MatchStatRow("REMATES AL ARCO", stats.homeShotsOnTarget, stats.awayShotsOnTarget)
+                MatchStatRow("REMATES FUERA", stats.homeShotsOffTarget, stats.awayShotsOffTarget)
                 MatchStatRow("TOTAL REMATES", stats.homeShots, stats.awayShots)
+                MatchStatRow("REMATES BLOQUEADOS", stats.homeBlockedShots, stats.awayBlockedShots)
                 MatchStatRow("TIROS DE ESQUINA", stats.homeCorners, stats.awayCorners)
                 MatchStatRow("FALTAS COMETIDAS", stats.homeFouls, stats.awayFouls)
+                MatchStatRow("FUERAS DE JUEGO", stats.homeOffsides, stats.awayOffsides)
+                MatchStatRow("TIROS LIBRES", stats.homeFreeKicks, stats.awayFreeKicks)
+                MatchStatRow("SAQUES DE META", stats.homeGoalKicks, stats.awayGoalKicks)
+                MatchStatRow("ATAJADAS", stats.homeSaves, stats.awaySaves)
+                MatchStatRow("SAQUES DE BANDA", stats.homeThrowIns, stats.awayThrowIns)
+                MatchStatRow("TARJETAS AMARILLAS", stats.homeYellowCards, stats.awayYellowCards)
+                MatchStatRow("TARJETAS ROJAS", stats.homeRedCards, stats.awayRedCards)
             }
         }
     }

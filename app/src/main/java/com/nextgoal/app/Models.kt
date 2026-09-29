@@ -28,7 +28,8 @@ data class Match(
     val venue: String = "Estadio por confirmar",
     val kickoffMillis: Long = 0L,
     val stats: MatchStats? = null,
-    val events: List<MatchEvent> = emptyList()
+    val events: List<MatchEvent> = emptyList(),
+    val externalEventId: String? = null
 )
 
 data class MatchStats(
@@ -36,12 +37,30 @@ data class MatchStats(
     val awayPossession: Int? = null,
     val homeShotsOnTarget: Int? = null,
     val awayShotsOnTarget: Int? = null,
+    val homeShotsOffTarget: Int? = null,
+    val awayShotsOffTarget: Int? = null,
     val homeShots: Int? = null,
     val awayShots: Int? = null,
+    val homeBlockedShots: Int? = null,
+    val awayBlockedShots: Int? = null,
     val homeCorners: Int? = null,
     val awayCorners: Int? = null,
     val homeFouls: Int? = null,
-    val awayFouls: Int? = null
+    val awayFouls: Int? = null,
+    val homeOffsides: Int? = null,
+    val awayOffsides: Int? = null,
+    val homeFreeKicks: Int? = null,
+    val awayFreeKicks: Int? = null,
+    val homeGoalKicks: Int? = null,
+    val awayGoalKicks: Int? = null,
+    val homeSaves: Int? = null,
+    val awaySaves: Int? = null,
+    val homeThrowIns: Int? = null,
+    val awayThrowIns: Int? = null,
+    val homeYellowCards: Int? = null,
+    val awayYellowCards: Int? = null,
+    val homeRedCards: Int? = null,
+    val awayRedCards: Int? = null
 )
 
 data class MatchEvent(
@@ -192,5 +211,6 @@ data class DashboardState(
     ),
     val isRefreshing: Boolean = false,
     val dataSourceLabel: String = "Cargando datos en vivo",
-    val lastUpdatedLabel: String = "Esperando actualización"
+    val lastUpdatedLabel: String = "Esperando actualización",
+    val refreshingMatchId: Int? = null
 )

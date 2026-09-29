@@ -20,6 +20,7 @@ class NextGoalViewModel(application: Application) : AndroidViewModel(application
     private var refreshJob: Job? = null
     private var directorySearchJob: Job? = null
     private var directoryDetailsJob: Job? = null
+    private var matchDetailsJob: Job? = null
 
     private val _dashboard = MutableStateFlow(DashboardState())
     val dashboard: StateFlow<DashboardState> = _dashboard.asStateFlow()
@@ -54,8 +55,29 @@ class NextGoalViewModel(application: Application) : AndroidViewModel(application
                 data = result.first,
                 isRefreshing = false,
                 dataSourceLabel = result.second,
-                lastUpdatedLabel = "Actualizado ${ZonedDateTime.now(NEXT_GOAL_TIME_ZONE).format(DateTimeFormatter.ofPattern("HH:mm", NEXT_GOAL_LOCALE))}"
+                lastUpdatedLabel = "Actualizado ${ZonedDateTime.now(NEXT_GOAL_TIME_ZONE).format(DateTimeFormatter.ofPattern("HH:mm", NEXT_GOAL_LOCALE))}",
+                refreshingMatchId = null
             )
+        }
+    }
+
+    fun refreshMatchDetails(matchId: Int) {
+        if (matchDetailsJob?.isActive == true) return
+        val currentMatch = _dashboard.value.data.matches.firstOrNull { it.id == matchId } ?: return
+        matchDetailsJob = viewModelScope.launch {
+            _dashboard.update { it.copy(refreshingMatchId = matchId) }
+            val refreshed = repository.loadMatchDetails(currentMatch)
+            _dashboard.update { state ->
+                val matches = if (refreshed == null) {
+                    state.data.matches
+                } else {
+                    state.data.matches.map { if (it.id == matchId) refreshed else it }
+                }
+                state.copy(
+                    data = state.data.copy(matches = matches),
+                    refreshingMatchId = null
+                )
+            }
         }
     }
 
