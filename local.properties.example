@@ -1,0 +1,8 @@
+# Copy this file to "local.properties" (same folder) and fill in your values.
+# Android Studio also writes sdk.dir automatically into local.properties, keep that line too.
+
+sdk.dir=/path/to/your/Android/sdk
+
+# Free API key from https://www.football-data.org/client/register
+# Needed for real, live match scores, standings and real team crest images.
+FOOTBALL_DATA_API_KEY=PASTE_YOUR_KEY_HERE

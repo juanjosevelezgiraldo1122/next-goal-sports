@@ -1,0 +1,13 @@
+NextGoal — copia preparada
+
+Abrir el proyecto:
+1. En Android Studio, elige File > Open.
+2. Selecciona la carpeta nexgoal-version-final (la carpeta raíz que contiene settings.gradle.kts).
+3. Espera a que termine Gradle Sync.
+4. Selecciona Pixel 10 Pro o Pixel 10 Pro XL y pulsa Run (▶).
+
+La clave de football-data.org y la ruta del Android SDK se conservaron en local.properties. No publiques ese archivo ni compartas la clave.
+
+La compilación debug incluida está en dist/NextGoal-debug.apk.
+
+Los partidos en directo requieren que el emulador y la red puedan abrir https://api.football-data.org:443. En la red usada al preparar esta copia, esa conexión fue rechazada; si la app muestra un error de conexión, cambia la conexión de la computadora (por ejemplo, a un punto de acceso móvil) y toca Reintentar.
